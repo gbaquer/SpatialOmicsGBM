@@ -1,0 +1,95 @@
+---
+title: "Investigative needle core biopsies for multi-omics in Glioblastoma"
+author: "Gerard Baquer"
+date: "7/31/2023"
+output: html_document
+---
+```{r}
+#Libraries
+library("ggplot2")
+library("ggrepel")
+```
+
+```{r}
+#Read
+pks<-GBMSpatialOmics:::load("PATH/TO/MSI_DATA")
+#Load annotations
+pks<-GBMSpatialOmics:::exp.loadAnnotations(pks,"PATH/TO/METABOSCAPE_ANNOTATIONS",3,"metaboscape")
+```
+
+```{r}
+#Untargeted analysis
+pks<-GBMSpatialOmics:::exp.UMAP(pks,"all",n=2)
+pks<-GBMSpatialOmics:::exp.DBSCAN(pks,"all")
+```
+```{r}
+#Plot untargeted analysis
+GBMSpatialOmics:::exp.plotUMAP(pks,"all")
+GBMSpatialOmics:::exp.plotUMAP(pks,"all",1)
+GBMSpatialOmics:::exp.plotUMAP(pks,"all",2)
+GBMSpatialOmics:::exp.plotDBSCAN(pks,"all",2)
+```
+
+```{r}
+#Export for image registration
+GBMSpatialOmics:::reg.exportimages(pks,pks$df$umap2.all,"PATH/TO/REGISTRATION_FOLDER")
+```
+
+```{r}
+#Import Cells
+pks<-GBMSpatialOmics:::reg.importCells(pks,"PATH/TO/REGISTERED_CD45+_Cells","immune")
+```
+```{r}
+#Perform spatial pathway enrichment analysis
+GBMSpatialOmics:::pathway.initializeEnrichment()
+pks<-GBMSpatialOmics:::pathway.completeEnrichment(pks)
+```
+
+```{r}
+#Plot selected images
+GBMSpatialOmics:::plot.ion(pks,pks$df$cells.immune,q = 0.99)+ scale_fill_distiller(palette="RdYlBu")
+
+GBMSpatialOmics:::plot.ion(pks,pks$pathway$enrichment[,match("Linoleic acid metabolism",colnames(pks$pathway$enrichment))])+geom_point(aes(x=x,y=-y,fill=1,color="red"),data=pks$cells$immune,alpha=0.5,size=1.5)
+```
+
+```{r}
+#Statistical tests
+pks$df$tissue<-apply(pks$intensity,1,sum)>1.5e8
+pks$df$immune.discrete<-as.factor((v>0)+2*(v>=4))
+levels(pks$df$immune.discrete)<-c("NI","I","I+")
+
+is1<-which(pks$df$tissue&(pks$df$immune.discrete!="NI"))
+is2<-which(pks$df$tissue&(pks$df$immune.discrete=="NI"))
+n=800
+pvals<-p.adjust(sapply(1:length(pks$mass),function(i)t.test(pks$intensity[is1[sample(1:length(is1),n)],i],pks$intensity[is2[sample(1:length(is2),n)],i])$p.value),"fdr")
+c<-sapply(1:length(pks$mass),function(i)cor(pks$intensity[,i],pks$df$cells.immune)) 
+df<-data.frame(pval=-log10(pvals))  
+df<-cbind(df,pks$ions)
+df$c<-c
+
+#Plot correlation
+df$label<-df$molecule
+df$label[df$pval<(-log10(0.05))|abs(df$cor.immune)<0.03]<-NA
+df$color="CD45+"
+df$color[df$cor.immune<0]="CD45-"
+df$label[sapply(df$label,nchar)>15|sapply(df$label,nchar)<2]<-NA
+
+ggplot(df,aes(x=cor.immune,y=pval,label=label,color=color))+geom_point(color="gray",alpha=0.2)+theme_classic()+geom_vline(xintercept = c(-0.03,0.03),linetype="dotted",color="gray",size=1)+geom_hline(yintercept = c(-log10(0.05)),linetype="dotted",color="gray",size=1)+geom_text_repel(force = 200,max.overlaps = 8, size=3.5)+xlab("Pearson's r")+ylab("-log10(pval)")+scale_color_manual(name="",values=c("#680F6F", "#F2574A"))+ theme(legend.position = "none")
+```
+
+```{r}
+#Export results
+write.csv(df,"PATH/TO/RESULTS")
+```
+
+
+
+
+
+
+
+
+
+
+
+
