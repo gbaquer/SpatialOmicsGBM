@@ -1,0 +1,223 @@
+---
+title: "Hypothesis testing H&E"
+author: "Gerard Baquer"
+date: "2024-09-09"
+output: html_document
+---
+
+```{r}
+# Libraries
+library(rhdf5)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+
+# Remove non-biological pixels
+he.rename_labels<-function(img,labels=c("background","CMC","viable tumor","infiltrative tumor","degraded viable tumor","degraded infiltrative tumor","necrosis/tissue degradation","vasculature","artifact","bubble","fold","fibre","calcification","hemorrhage","debris")){
+  levels(img$segmentation)<-labels[as.numeric(levels(img$segmentation))]
+  return(img)
+}
+he.remove_nonbiological<-function(img,remove=c("background","CMC","artifact","bubble","fold","fibre","debris")){
+  img$segmentation[img$segmentation%in%remove]<-NA
+  return(img)
+}
+# Run Montecarlo Simulation
+he.montecarlo<-function(img,n=1000,size=NULL,um=NULL,ratio=0.32249742002){
+  if(is.null(size))
+    size=um/ratio
+  # Sample n centers within the tissue
+  tictoc::tic()
+  tissue<-which(!is.na(img$segmentation))
+  centers<-sample(tissue,n)
+  tictoc::toc()
+  
+  # Order in preparation for search
+  tictoc::tic()
+  ox<-sort(img$pos$x,index.return=T,method="radix")
+  oy<-sort(img$pos$y,index.return=T,method="radix")
+  tictoc::toc() 
+  
+  # Get pixels of the ROI
+  tictoc::tic()
+  hx<-sapply(img$pos[centers,1]+size/2,function(x)Rfast::binary_search(ox$x,x,T))
+  lx<-sapply(img$pos[centers,1]-size/2,function(x)Rfast::binary_search(ox$x,x,T))
+  hy<-sapply(img$pos[centers,2]+size/2,function(x)Rfast::binary_search(oy$x,x,T))
+  ly<-sapply(img$pos[centers,2]-size/2,function(x)Rfast::binary_search(oy$x,x,T))
+  tictoc::toc() 
+  
+  tictoc::tic()
+  ix<-lapply(1:length(centers),function(i)ox$ix[lx[i]:hx[i]])
+  iy<-lapply(1:length(centers),function(i)oy$ix[ly[i]:hy[i]])
+  tictoc::toc()
+  tictoc::tic()
+  rois<-lapply(1:length(centers),function(i)intersect(ix[[i]],iy[[i]])) #This is the bottleneck
+  tictoc::toc()
+  
+  # Get table of each ROI
+  tictoc::tic()
+  mc<-as.data.frame(do.call(rbind,lapply(rois,function(is)table(img$segmentation[is]))))
+  tictoc::toc()
+  return(list(mc=mc,mcnorm=t(apply(mc,1,function(x)x/sum(x))),centers=centers,rois=rois))
+}
+
+```
+
+
+```{r}
+# Prepare metadata
+meta<-data.frame(file=list.files("A:/122. H&E Heterogeneity Quantitation/BTC pilot HE/",pattern = "Probabilities.h5",full.names = T))
+meta$sample<-gsub("_Probabilities.h5","",basename(meta$file))
+meta$biopsy<-sapply(strsplit(meta$sample,"-"),function(x)x[[1]])
+meta$replicate<-sapply(strsplit(meta$sample,"-"),function(x)x[[2]])
+meta$csv<-gsub("_Probabilities.h5","_montecarlo.csv",meta$file)
+write.table(meta,"A:/122. H&E Heterogeneity Quantitation/BTC pilot HE/metadata.csv",sep=",",row.names = F)
+  
+# Load and prepare data
+probs <- lapply(meta$file,function(x)h5read(x, "/exported_data"))
+segmentation <- lapply(probs,function(x)apply(x,c(2,3),which.max))
+imgs <- lapply(segmentation,function(x)list(segmentation=factor(x),pos=expand.grid(x=1:nrow(x),y=1:ncol(x))))
+imgs <- lapply(imgs,he.rename_labels)
+imgs <- lapply(imgs,he.remove_nonbiological)
+```
+
+```{r}
+#QC segmentation
+labels<-c("viable tumor","infiltrative tumor","degraded viable tumor","degraded infiltrative tumor","necrosis/tissue degradation","vasculature","other")
+colors<-scico::scico(length(labels), palette = "managua")
+colors<-setNames(colors, labels)
+f<-5
+for(i in 1:length(imgs)){
+  df<-data.frame(imgs[[i]]$pos)
+  df$i<-as.character(imgs[[i]]$segmentation)
+  df$i[df$i%in%c("calcification","hemorrhage")]<-"other"
+  df$i<-factor(df$i,levels=labels)
+  df<-df[df$x%%f==0 & df$y%%f==0,]
+  df$x<-df$x/f
+  df$y<-df$y/f
+  ggplot(df,aes(x=x,y=-y,fill=i))+geom_raster()+theme_void()+coord_fixed()+ggtitle(meta$sample[i])+scale_fill_manual(values = colors,na.value = "transparent")
+  ggsave(paste0("A:/122. H&E Heterogeneity Quantitation/plots/segmentation_qc/",meta$sample[i],".tiff"),dpi=300,width=4,height=4)
+}
+```
+```{r}
+# Run Montecarlo Simulation
+ums<-c(200,100,50,20)
+sims<-lapply(ums,function(um)lapply(imgs,he.montecarlo,um=um))
+lapply(1:length(sims),function(i)lapply(1:length(imgs),function(j)write.table(sims[[i]][[j]]$mcnorm,gsub(".csv",paste0(ums[i],"um.csv"),meta$csv[j]),sep=",",row.names=F)))
+```
+```{r}
+#Show some segments
+for(k in 1:length(sims)){
+  for(i in 1:length(imgs)){
+    for(j in 1:10){
+      is<-sims[[k]][[i]]$rois[[j]]
+      df<-data.frame(imgs[[i]]$pos[is,])
+      df$i<-imgs[[i]]$segmentation[is]
+      ggplot(df,aes(x=x,y=-y,fill=i))+geom_raster()+theme_void()+coord_fixed()+ggtitle(meta$sample[i])+scale_fill_manual(values = colors,na.value = "transparent")+theme(legend.position = "none")
+      ggsave(paste0("A:/122. H&E Heterogeneity Quantitation/plots/subsets/",ums[k],"/",meta$sample[i],"_",j,".tiff"),dpi=300,width=4,height=4)
+    }
+  }
+}
+```
+
+```{r}
+# Compute statistics
+#PCA
+data<-do.call(dplyr::bind_rows,lapply(sims,function(x)do.call(dplyr::bind_rows,lapply(x,function(y)as.data.frame(y$mcnorm)))))
+data[is.na(data)]<-0
+pca<-prcomp(data)
+
+for(um in ums){
+  #PLOT PCA
+  df<-data.frame(pca$x)
+  df$size<-rep(ums,each=7000)
+  df$sample<-rep(meta$sample,each=1000)
+  df$biopsy<-rep(meta$biopsy,each=1000)
+  df$replicate<-rep(meta$replicate,each=1000)
+  ve<-(pca$sdev)^2/sum((pca$sdev)^2)
+  xlab<-paste0("PC1 (",round(100*ve[1],2),"%)")
+  ylab<-paste0("PC2 (",round(100*ve[2],2),"%)")
+  colors<-c(colorRampPalette(c("#FFFFFF", "#9966CC","#000000"))(5)[2:4],
+            colorRampPalette(c("#FFFFFF", "#FA8072","#000000"))(4)[2:3],
+            colorRampPalette(c("#FFFFFF", "#008080","#000000"))(4)[2:3])
+  df<-subset(df,size==um)
+  ggplot(df[sample(1:nrow(df),nrow(df)),],aes(x=PC1,y=PC2,color=biopsy))+geom_point(alpha=0.1)+theme_classic()+coord_fixed()+scale_color_manual(values=c("#9966CC","#FA8072","#008080"))+ylim(c(-1.5,1.5))+xlim(c(-1.5,1.5))+theme(axis.text=element_blank(),axis.ticks=element_blank(),legend.position = "bottom")+xlab(xlab)+ylab(ylab)
+  ggplot(df,aes(x=PC1,y=PC2,color=biopsy))+geom_density2d(h=0.5)+theme_classic()+coord_fixed()+scale_color_manual(values=c("#9966CC","#FA8072","#008080"))+ylim(c(-1.5,1.5))+xlim(c(-1.5,1.5))+theme(axis.text=element_blank(),axis.ticks=element_blank(),legend.position = "bottom")+xlab(xlab)+ylab(ylab)
+  ggsave(paste0("A:/122. H&E Heterogeneity Quantitation/plots/pca2/pca_all_",um,"um.tiff"),dpi=300,height=4,width=4)
+  ggplot(subset(df,biopsy==1),aes(x=PC1,y=PC2,color=sample))+geom_density2d(h=0.5)+theme_classic()+coord_fixed()+scale_color_manual(values=colors[1:3])+ylim(c(-1.5,1.5))+xlim(c(-1.5,1.5))+theme(axis.text=element_blank(),axis.ticks=element_blank(),legend.position = "bottom")+xlab(xlab)+ylab(ylab)
+  ggsave(paste0("A:/122. H&E Heterogeneity Quantitation/plots/pca2/pca_1_",um,"um.tiff"),dpi=300,height=4,width=4)
+  ggplot(subset(df,biopsy==2),aes(x=PC1,y=PC2,color=sample))+geom_density2d(h=0.5)+theme_classic()+coord_fixed()+scale_color_manual(values=colors[4:5])+ylim(c(-1.5,1.5))+xlim(c(-1.5,1.5))+theme(axis.text=element_blank(),axis.ticks=element_blank(),legend.position = "bottom")+xlab(xlab)+ylab(ylab)
+  ggsave(paste0("A:/122. H&E Heterogeneity Quantitation/plots/pca2/pca_2_",um,"um.tiff"),dpi=300,height=4,width=4)
+  ggplot(subset(df,biopsy==3),aes(x=PC1,y=PC2,color=sample))+geom_density2d(h=0.5)+theme_classic()+coord_fixed()+scale_color_manual(values=colors[6:7])+ylim(c(-1.5,1.5))+xlim(c(-1.5,1.5))+theme(axis.text=element_blank(),axis.ticks=element_blank(),legend.position = "bottom")+xlab(xlab)+ylab(ylab)
+  ggsave(paste0("A:/122. H&E Heterogeneity Quantitation/plots/pca2/pca_3_",um,"um.tiff"),dpi=300,height=4,width=4)
+  write.csv(df,paste0("A:/122. H&E Heterogeneity Quantitation/plots/pca2/pca_",um,"um.csv"),sep=",",row.names = T)
+  
+  #PLOT LOADINGS
+  df<-data.frame(pca$rotation)
+  df$tissue<-row.names(df)
+  df$length<-apply(df[,1:2],1,function(x)sqrt(sum(x^2)))
+  df$length/max(df$length)
+  ggplot(subset(df,length>0.05),aes(x=0,y=0,xend=PC1,yend=PC2))+geom_segment(arrow = arrow(length = unit(0.2, "cm")),color ="#D4A017")+ geom_text_repel(aes(x=PC1,y=PC2,label=tissue))+theme_classic()+coord_fixed()+xlab(xlab)+ylab(ylab)
+  ggsave(paste0("A:/122. H&E Heterogeneity Quantitation/plots/pca2/loadings_",um,"um.tiff"),dpi=300,height=4,width=4)
+  write.csv(df,paste0("A:/122. H&E Heterogeneity Quantitation/plots/pca2/loadings_",um,"um.csv"),sep=",",row.names = T)
+}
+```
+```{r}
+# STATISTICS
+data<-do.call(dplyr::bind_rows,lapply(sims,function(x)do.call(dplyr::bind_rows,lapply(x,function(y)as.data.frame(y$mcnorm)))))
+data[is.na(data)]<-0
+colnames(data)<-c("background","CMC","vt","it","dvt","dit","n","v","artifact","bubble","fold","fibre","h","debris","c")
+data$size<-rep(ums,each=7000)
+data$sample<-rep(meta$sample,each=1000)
+data$biopsy<-rep(meta$biopsy,each=1000)
+data$replicate<-rep(meta$replicate,each=1000)
+
+# PREPARE OUTPUT TABLE
+df<-expand.grid(pvalue=NA,comparison=c("1v2","1v3","2v3"),test=c("viable_tumor","all","all_20um","all_corrected_20um"))
+
+# VIABLE TUMOR
+out<-nlme::lme(fixed=vt~ biopsy*size+biopsy+size,data=subset(data,biopsy%in%c(1,2)),random=~1|sample,method="ML")
+df$pvalue[1]=coef(summary(out))[2,"p-value"]
+
+out<-nlme::lme(fixed=vt~ biopsy*size+biopsy+size,data=subset(data,biopsy%in%c(1,3)),random=~1|sample,method="ML")
+df$pvalue[2]=coef(summary(out))[2,"p-value"]
+
+out<-nlme::lme(fixed=vt~ biopsy*size+biopsy+size,data=subset(data,biopsy%in%c(2,3)),random=~1|sample,method="ML")
+df$pvalue[3]=coef(summary(out))[2,"p-value"]
+
+# ALL CLASSES
+
+out<-nlme::lme(fixed=n+vt+it+v+c~ biopsy*size+biopsy+size,data=subset(data,biopsy%in%c(1,2)),random=~1|sample,method="ML")
+df$pvalue[4]=coef(summary(out))[2,"p-value"]
+
+out<-nlme::lme(fixed=n+vt+it+v+c~ biopsy*size+biopsy+size,data=subset(data,biopsy%in%c(1,3)),random=~1|sample,method="ML")
+df$pvalue[5]=coef(summary(out))[2,"p-value"]
+
+out<-nlme::lme(fixed=n+vt+it+v+c~ biopsy*size+biopsy+size,data=subset(data,biopsy%in%c(2,3)),random=~1|sample,method="ML")
+df$pvalue[6]=coef(summary(out))[2,"p-value"]
+
+#ALL CLASSES 20um
+
+out<-nlme::lme(fixed=n+vt+it+v+c~ biopsy,data=subset(data,biopsy%in%c(1,2)&size==20),random=~1|sample,method="ML")
+df$pvalue[7]=coef(summary(out))[2,"p-value"]
+
+out<-nlme::lme(fixed=n+vt+it+v+c~ biopsy,data=subset(data,biopsy%in%c(1,3)&size==20),random=~1|sample,method="ML")
+df$pvalue[8]=coef(summary(out))[2,"p-value"]
+
+out<-nlme::lme(fixed=n+vt+it+v+c~ biopsy,data=subset(data,biopsy%in%c(2,3)&size==20),random=~1|sample,method="ML")
+df$pvalue[9]=coef(summary(out))[2,"p-value"]
+
+#ALL CORRECTION 20 um
+tmp<-compositions::clr(data[,1:15])
+out<-nlme::lme(fixed=n+vt+it+v+c+dvt+dit+h~ biopsy,data=subset(cbind(tmp,data[16:ncol(data)]),biopsy%in%c(1,2)&size==20),random=~1|sample,method="ML")
+df$pvalue[10]=coef(summary(out))[2,"p-value"]
+
+out<-nlme::lme(fixed=n+vt+it+v+c+dvt+dit+h~ biopsy,data=subset(cbind(tmp,data[16:ncol(data)]),biopsy%in%c(1,3)&size==20),random=~1|sample,method="ML")
+df$pvalue[11]=coef(summary(out))[2,"p-value"]
+
+out<-nlme::lme(fixed=n+vt+it+v+c+dvt+dit+h~ biopsy,data=subset(cbind(tmp,data[16:ncol(data)]),biopsy%in%c(2,3)&size==20),random=~1|sample,method="ML")
+df$pvalue[12]=coef(summary(out))[2,"p-value"]
+# EXPORT RESULTS
+write.csv(df,"A:/122. H&E Heterogeneity Quantitation/plots/group_comparisons.csv")
+```
+
